@@ -1,5 +1,6 @@
 # Arc-V6
-![image](https://github.com/user-attachments/assets/4da5619b-c68a-4c14-96b2-50f5ef3fe646)
+![image](https://github.com/user-attachments/assets/015e2989-8cc3-4f0f-93a5-03b7db60878a)
+
 
 # Table of Contents  
 [Introduction](#introduction)  
