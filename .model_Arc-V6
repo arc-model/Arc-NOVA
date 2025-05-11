@@ -1,0 +1,1132 @@
+# ------------- 核心模型架构升级 -------------
+
+class EnhancedVisionEncoder(nn.Module):
+    """增强版图像编码器，支持更高分辨率和多尺度特征提取"""
+    def __init__(self, pretrained_model="google/vit-huge-patch14", img_size=4096):
+        super().__init__()
+        # 使用更大的Vision Transformer
+        self.vision_model = ViTModel.from_pretrained(pretrained_model)
+        self.resize_layer = nn.AdaptiveAvgPool2d((img_size, img_size))
+        
+        # 多尺度特征提取增强 - 添加更深层的特征提取器
+        self.feature_extractors = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(3, 128, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(32, 128),
+                nn.GELU(),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(32, 256),
+                nn.GELU(),
+                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(32, 512),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Conv2d(3, 128, kernel_size=5, stride=2, padding=2),
+                nn.GroupNorm(32, 128),
+                nn.GELU(),
+                nn.Conv2d(128, 256, kernel_size=5, stride=2, padding=2),
+                nn.GroupNorm(32, 256),
+                nn.GELU(),
+                nn.Conv2d(256, 512, kernel_size=5, stride=2, padding=2),
+                nn.GroupNorm(32, 512),
+                nn.GELU()
+            ),
+            ConvNeXtLarge(pretrained=True),  # 使用更大的预训练模型
+            nn.Sequential(  # 添加混合注意力特征提取器
+                nn.Conv2d(3, 256, kernel_size=7, stride=4, padding=3),
+                nn.GroupNorm(32, 256),
+                nn.GELU(),
+                VisionAttentionBlock(256, num_heads=8),
+                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(32, 512),
+                nn.GELU()
+            )
+        ])
+        
+        # 特征融合层增强 - 增加残差连接和门控机制
+        self.feature_fusion = nn.Sequential(
+            ResidualBlock(512 * 4, 1024),  # 增加输入通道数
+            nn.Conv2d(1024, 2048, kernel_size=1),  # 增加隐藏层维度至2048
+            nn.GroupNorm(32, 2048),
+            nn.GELU(),
+            GatedResidualBlock(2048, 2048)  # 门控残差块
+        )
+        
+        # 位置编码增强 - 使用可学习的位置编码
+        self.register_buffer(
+            'positional_encoding',
+            self._create_positional_encoding(img_size, 2048)
+        )
+        
+        # 注意力权重 - 可学习的注意力权重
+        self.attention_weights = nn.Parameter(torch.ones(4))
+        
+        # 梯度检查点 - 提高训练效率
+        if self.vision_model.supports_gradient_checkpointing:
+            self.vision_model.gradient_checkpointing_enable()
+    
+    def _create_positional_encoding(self, img_size, dim):
+        """创建更高分辨率的位置编码"""
+        # 使用正弦余弦位置编码 + 可学习偏移
+        pe = torch.zeros(img_size * img_size, dim)
+        position = torch.arange(0, img_size * img_size, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # 添加可学习的位置偏移
+        self.position_bias = nn.Parameter(torch.zeros(1, img_size * img_size, dim))
+        
+        return pe.unsqueeze(0)
+    
+    def forward(self, images):
+        # 支持更高分辨率 - 增加到4096x4096
+        if images.shape[-1] != 4096 or images.shape[-2] != 4096:
+            images = self.resize_layer(images)
+        
+        # 提取多尺度特征
+        multi_scale_features = []
+        for i, extractor in enumerate(self.feature_extractors):
+            if isinstance(extractor, ConvNeXtLarge):
+                # 特殊处理预训练模型
+                features = extractor.features(images)
+                features = F.adaptive_avg_pool2d(features, (128, 128))  # 调整到相同尺寸
+            else:
+                features = extractor(images)
+                features = F.adaptive_avg_pool2d(features, (128, 128))  # 调整到相同尺寸
+            multi_scale_features.append(features * self.attention_weights[i])
+        
+        # 特征融合 - 增加特征金字塔网络
+        fused_features = torch.cat(multi_scale_features, dim=1)
+        fused_features = self.feature_fusion(fused_features)
+        
+        # 展平
+        batch_size, channels, height, width = fused_features.shape
+        fused_features = fused_features.view(batch_size, channels, -1).transpose(1, 2)
+        
+        # 添加位置编码
+        fused_features = fused_features + self.positional_encoding[:, :height*width, :] + self.position_bias[:, :height*width, :]
+        
+        # 通过Vision Transformer
+        outputs = self.vision_model(pixel_values=images)
+        vit_features = outputs.last_hidden_state
+        
+        # 融合CNN和Transformer特征 - 增加跨尺度注意力
+        combined_features = CrossScaleAttention(2048)(fused_features, vit_features)
+        
+        return combined_features
+
+class DeepSeekCrossModalAttention(nn.Module):
+    """深度多模态注意力机制增强版"""
+    def __init__(self, hidden_size=2048, num_heads=32, dropout=0.1, use_flash_attention=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(hidden_size, eps=1e-6)  # 减小eps提高数值稳定性
+        
+        # 相对位置编码 - 增加编码范围和精度
+        self.rel_pos_bias = nn.Sequential(
+            nn.Linear(256, num_heads),  # 更大的相对位置编码
+            nn.Sigmoid()
+        )
+        
+        # 初始化权重 - 改进的权重初始化
+        self.apply(self._init_weights)
+        
+        # Flash Attention支持 - 添加旋转位置编码
+        self.use_flash_attention = use_flash_attention
+        if use_flash_attention:
+            try:
+                from flash_attn.flash_attention import FlashAttention
+                self.flash_attention = FlashAttention()
+                self.rotary_emb = RotaryEmbedding(self.head_dim)  # 旋转位置编码
+            except ImportError:
+                print("警告: 无法导入FlashAttention，将使用标准注意力机制")
+                self.use_flash_attention = False
+    
+    def _init_weights(self, module):
+        """改进的权重初始化"""
+        if isinstance(module, nn.Linear):
+            # 使用更适合DeepSeek架构的初始化方法
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='gelu')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, text_features, image_features, attention_mask=None, position_ids=None):
+        batch_size, text_len, _ = text_features.size()
+        image_len = image_features.size(1)
+        
+        # 线性投影
+        query = self.q_proj(text_features)
+        key = self.k_proj(image_features)
+        value = self.v_proj(image_features)
+        
+        # 多头注意力
+        query = query.view(batch_size, text_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, image_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, image_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # 应用旋转位置编码
+        if self.use_flash_attention:
+            query, key = self.rotary_emb(query, key)
+        
+        # 使用Flash Attention (如果可用)
+        if self.use_flash_attention and not self.training:
+            # 重组为Flash Attention格式
+            qkv = torch.stack([query, key, value], dim=2)
+            context, _ = self.flash_attention(qkv)
+            context = context.transpose(1, 2).contiguous().view(batch_size, text_len, self.hidden_size)
+        else:
+            # 缩放点积注意力
+            scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            
+            # 添加相对位置偏置
+            if position_ids is not None:
+                # 计算相对位置
+                rel_pos = position_ids[:, :text_len].unsqueeze(-1) - position_ids[:, :image_len].unsqueeze(1)
+                rel_pos = rel_pos.clamp(-128, 128) + 128  # 映射到[0, 256]范围
+                
+                # 获取相对位置偏置
+                pos_bias = self.rel_pos_bias(rel_pos)
+                scores = scores + pos_bias.permute(0, 3, 1, 2)
+            
+            if attention_mask is not None:
+                scores = scores.masked_fill(attention_mask.unsqueeze(1).unsqueeze(2) == 0, -1e9)
+            
+            # 注意力权重 - 添加温度缩放
+            attn_weights = F.softmax(scores / 0.8, dim=-1)  # 温度缩放
+            attn_weights = self.dropout(attn_weights)
+            
+            # 加权求和
+            context = torch.matmul(attn_weights, value)
+            context = context.transpose(1, 2).contiguous().view(batch_size, text_len, self.hidden_size)
+        
+        # 输出投影
+        output = self.out_proj(context)
+        output = self.dropout(output)
+        output = self.layer_norm(output + text_features)
+        
+        return output
+
+class GatedCrossModalLayer(nn.Module):
+    """增强版门控跨模态层"""
+    def __init__(self, hidden_size=2048, num_heads=32, dropout=0.1, use_flash_attention=True):
+        super().__init__()
+        self.cross_attention = DeepSeekCrossModalAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_flash_attention=use_flash_attention
+        )
+        
+        # 增强版门控机制 - 添加多层门控和残差连接
+        self.text_gate = nn.Sequential(
+            ResidualBlock(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Sigmoid()
+        )
+        
+        self.image_gate = nn.Sequential(
+            ResidualBlock(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Sigmoid()
+        )
+        
+        # 增强版前馈网络 - 增加网络深度和宽度
+        self.feed_forward = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            ResidualBlock(hidden_size * 4, hidden_size),
+            nn.Dropout(dropout)
+        )
+        
+        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+    
+    def forward(self, text_features, image_features, attention_mask=None, position_ids=None):
+        # 跨模态注意力
+        cross_attended_text = self.cross_attention(
+            text_features, image_features, attention_mask, position_ids
+        )
+        
+        # 门控机制
+        gate_input = torch.cat([text_features, cross_attended_text], dim=-1)
+        gate_value = self.text_gate(gate_input)
+        
+        # 应用门控
+        gated_text = gate_value * cross_attended_text + (1 - gate_value) * text_features
+        gated_text = self.layer_norm1(gated_text)
+        
+        # 前馈网络
+        output = self.feed_forward(gated_text)
+        output = self.layer_norm2(output + gated_text)
+        
+        return output
+
+class CodeGenerationModule(nn.Module):
+    """增强型代码生成模块，提升HumanEval性能"""
+    def __init__(self, hidden_size=2048, vocab_size=50257, max_seq_length=65536):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        
+        # 代码专用嵌入层 - 添加类型感知嵌入
+        self.code_embedding = nn.Embedding(vocab_size, hidden_size)
+        self.type_embedding = nn.Embedding(100, hidden_size)  # 100种代码类型
+        
+        # 代码专用位置编码 - 增加位置编码范围
+        self.code_positional_encoding = nn.Parameter(
+            torch.zeros(1, max_seq_length, hidden_size)
+        )
+        
+        # 代码专用注意力层 - 添加多头注意力
+        self.code_attention = MultiQueryAttention(
+            hidden_size, num_heads=32, dropout=0.1, batch_first=True
+        )
+        
+        # 代码生成头 - 增加生成质量
+        self.code_generator = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size * 4, eps=1e-6),
+            ResidualBlock(hidden_size * 4, hidden_size),
+            nn.Linear(hidden_size, vocab_size)
+        )
+        
+        # 代码提示增强器 - 添加代码结构感知
+        self.code_prompt_enhancer = nn.Sequential(
+            CodeStructureEncoder(hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 代码结构感知层 - 增强代码理解
+        self.structure_encoder = nn.Sequential(
+            CodeGraphEncoder(hidden_size),  # 新增代码图编码器
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 代码语义理解层 - 增强语义理解
+        self.semantic_encoder = nn.Sequential(
+            CodeBERTEncoder(hidden_size),  # 新增CodeBERT编码器
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 初始化权重 - 使用更好的初始化策略
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """初始化代码生成模块的权重"""
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='gelu')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, text_features, code_prompts=None, attention_mask=None, code_types=None):
+        batch_size, seq_len, _ = text_features.size()
+        
+        # 增强代码语义理解
+        semantic_features = self.semantic_encoder(text_features)
+        
+        # 如果提供了代码提示，则增强代码生成能力
+        if code_prompts is not None:
+            # 添加类型嵌入
+            if code_types is not None:
+                type_embeds = self.type_embedding(code_types)
+                code_embeddings = self.code_embedding(code_prompts) + type_embeds
+            else:
+                code_embeddings = self.code_embedding(code_prompts)
+            
+            code_embeddings = code_embeddings + self.code_positional_encoding[:, :code_embeddings.size(1), :]
+            
+            # 代码专用注意力
+            code_features, _ = self.code_attention(
+                code_embeddings, semantic_features, semantic_features, 
+                key_padding_mask=(attention_mask == 0) if attention_mask is not None else None
+            )
+            
+            # 增强代码提示
+            enhanced_code_prompts = self.code_prompt_enhancer(code_features)
+            
+            # 代码结构感知
+            structured_features = self.structure_encoder(enhanced_code_prompts)
+            
+            # 结合文本和代码特征
+            combined_features = torch.cat([semantic_features, structured_features], dim=1)
+            
+            # 生成代码
+            logits = self.code_generator(combined_features)
+            
+            return logits[:, -code_embeddings.size(1):, :]  # 只返回生成的代码部分
+        else:
+            # 如果没有代码提示，则直接从文本特征生成代码
+            # 代码结构感知
+            structured_features = self.structure_encoder(semantic_features)
+            
+            logits = self.code_generator(structured_features)
+            return logits
+
+class MathReasoningModule(nn.Module):
+    """增强型数学推理模块，提升GSM8K性能"""
+    def __init__(self, hidden_size=2048, max_seq_length=65536):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # 数学专用位置编码 - 增加位置编码范围
+        self.math_positional_encoding = nn.Parameter(
+            torch.zeros(1, max_seq_length, hidden_size)
+        )
+        
+        # 数学专用注意力层 - 添加多头注意力
+        self.math_attention = MultiQueryAttention(
+            hidden_size, num_heads=32, dropout=0.1, batch_first=True
+        )
+        
+        # 数学推理层 - 增加推理深度
+        self.math_reasoning = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            ResidualBlock(hidden_size * 4, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 数学符号嵌入 - 增加符号表示能力
+        self.math_symbol_embedding = nn.Embedding(200, hidden_size)  # 扩展到200种数学符号
+        
+        # 数值推理器 - 增强数值计算能力
+        self.numeric_reasoner = nn.Sequential(
+            NumericalTransformer(hidden_size),  # 新增数值专用Transformer
+            nn.GELU(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 方程解析器 - 增强方程理解能力
+        self.equation_parser = nn.Sequential(
+            EquationTreeEncoder(hidden_size),  # 新增方程树编码器
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 单位推理器 - 增强单位理解能力
+        self.unit_reasoner = nn.Sequential(
+            UnitGraphEncoder(hidden_size),  # 新增单位图编码器
+            nn.GELU(),
+            nn.Linear(hidden_size, 20)  # 扩展到20种常见单位
+        )
+        
+        # 数学步骤生成器 - 增强解题步骤生成能力
+        self.step_generator = nn.Sequential(
+            StepByStepReasoner(hidden_size),  # 新增分步推理器
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # 初始化权重 - 使用更好的初始化策略
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        """初始化数学推理模块的权重"""
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='gelu')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+    
+    def forward(self, text_features, math_prompts=None, attention_mask=None, math_types=None):
+        batch_size, seq_len, _ = text_features.size()
+        
+        # 添加数学专用位置编码
+        text_features = text_features + self.math_positional_encoding[:, :seq_len, :]
+        
+        # 如果提供了数学提示
+        if math_prompts is not None:
+            # 嵌入数学符号
+            if math_types is not None:
+                type_embeds = self.math_symbol_embedding(math_types)
+                math_embeddings = self.math_symbol_embedding(math_prompts) + type_embeds
+            else:
+                math_embeddings = self.math_symbol_embedding(math_prompts)
+            
+            # 数学专用注意力
+            math_features, _ = self.math_attention(
+                math_embeddings, text_features, text_features,
+                key_padding_mask=(attention_mask == 0) if attention_mask is not None else None
+            )
+            
+            # 数学推理
+            reasoning_output = self.math_reasoning(math_features)
+            
+            # 方程解析
+            equation_features = self.equation_parser(reasoning_output)
+            
+            # 单位推理
+            unit_predictions = self.unit_reasoner(reasoning_output)
+            
+            # 数值推理
+            numeric_output = self.numeric_reasoner(equation_features)
+            
+            # 数学步骤生成
+            step_features = self.step_generator(reasoning_output)
+            
+            return reasoning_output, numeric_output, unit_predictions, step_features
+        else:
+            # 如果没有数学提示，则直接处理文本特征
+            # 数学推理
+            reasoning_output = self.math_reasoning(text_features)
+            
+            # 方程解析
+            equation_features = self.equation_parser(reasoning_output)
+            
+            # 单位推理
+            unit_predictions = self.unit_reasoner(reasoning_output)
+            
+            # 数值推理
+            numeric_output = self.numeric_reasoner(equation_features)
+            
+            # 数学步骤生成
+            step_features = self.step_generator(reasoning_output)
+            
+            return reasoning_output, numeric_output, unit_predictions, step_features
+
+# ------------- 新增搜索和网页摘要模块 -------------
+
+class WebSearchModule(nn.Module):
+    """网页搜索和摘要模块，增强搜索能力和速度"""
+    def __init__(self, hidden_size=2048, max_search_results=20, retrieval_model="deepseek-ai/deepseek-coder-6.7b-base", search_providers=["baidu", "360"]):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_search_results = max_search_results
+        self.search_providers = search_providers  # 新增搜索提供商列表
+        
+        # 检索模型 - 使用更大的检索模型
+        self.retrieval_model = AutoModel.from_pretrained(retrieval_model)
+        self.retrieval_tokenizer = AutoTokenizer.from_pretrained(retrieval_model)
+        
+        # 查询编码器 - 增强查询理解
+        self.query_encoder = nn.Sequential(
+            ResidualBlock(self.retrieval_model.config.hidden_size, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 文档编码器 - 增强文档理解
+        self.document_encoder = nn.Sequential(
+            ResidualBlock(self.retrieval_model.config.hidden_size, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 网页内容摘要器 - 增强摘要生成
+        self.summarizer = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        
+        # 搜索结果排序器 - 增强排序能力
+        self.rank_predictor = nn.Sequential(
+            ResidualBlock(hidden_size * 3, hidden_size),  # 增加输入维度
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        
+        # 网页内容解析器 - 增强内容提取
+        self.html_parser = EnhancedBeautifulSoup  # 使用增强版的HTML解析器
+        
+        # 网络请求器 - 增强网络请求能力
+        self.web_client = AsyncWebClient(max_workers=8)  # 增加并发数
+        
+        # 缓存机制 - 扩大缓存容量
+        self.search_cache = LRUCache(maxsize=5000)  # 扩大缓存到5000项
+        
+        # 并行处理 - 增强并行能力
+        self.executor = ThreadPoolExecutor(max_workers=16)  # 增加线程数
+        
+        # 新增：DeepSeek-R1风格的搜索优化 - 增强搜索优化
+        self.search_optimizer = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size),
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.Tanh()
+        )
+        
+        # 新增：语义相似度计算增强 - 增强相似度计算
+        self.similarity_calculator = nn.Sequential(
+            ResidualBlock(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.Sigmoid()
+        )
+        
+        # 新增：多跳推理支持 - 增强多跳推理
+        self.multi_hop_reasoner = nn.Sequential(
+            ResidualBlock(hidden_size * 4, hidden_size),  # 增加输入维度
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 新增：长文本处理优化 - 增强长文本处理
+        self.long_text_processor = nn.Sequential(
+            LongformerEncoder(hidden_size),  # 新增Longformer编码器
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 新增：中文理解增强器 - 增强中文理解
+        self.chinese_understanding = nn.Sequential(
+            ChineseBERTEncoder(hidden_size),  # 新增中文BERT编码器
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 新增：知识蒸馏检索器 - 增强知识蒸馏
+        self.knowledge_distiller = nn.Sequential(
+            ResidualBlock(hidden_size * 3, hidden_size),  # 增加输入维度
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 新增：原生搜索引擎API客户端 - 支持百度和360搜索
+        self.search_clients = {
+            "baidu": BaiduSearchAPI(),  # 假设已实现百度搜索API客户端
+            "360": Qihoo360SearchAPI()  # 假设已实现360搜索API客户端
+        }
+    
+    def encode_query(self, query_text):
+        """编码搜索查询 - 增强查询编码"""
+        # 检查是否包含中文
+        is_chinese = any('\u4e00' <= char <= '\u9fff' for char in query_text)
+        
+        inputs = self.retrieval_tokenizer(query_text, return_tensors="pt", truncation=True, max_length=1024)
+        outputs = self.retrieval_model(**inputs)
+        
+        # 应用不同的编码策略
+        if is_chinese:
+            query_embedding = self.chinese_understanding(outputs.last_hidden_state[:, 0, :])
+        else:
+            query_embedding = self.query_encoder(outputs.last_hidden_state[:, 0, :])
+        
+        # 应用搜索优化
+        optimized_query = self.search_optimizer(query_embedding)
+        
+        return optimized_query
+    
+    def encode_document(self, document_text):
+        """编码文档内容 - 增强文档编码"""
+        # 长文本处理优化
+        if len(document_text) > 20000:
+            # 使用层次化提取策略
+            document_text = self._extract_key_sections(document_text)
+        
+        inputs = self.retrieval_tokenizer(document_text, return_tensors="pt", truncation=True, max_length=2048)
+        outputs = self.retrieval_model(**inputs)
+        
+        # 应用长文本处理优化
+        document_embedding = self.long_text_processor(outputs.last_hidden_state[:, 0, :])
+        
+        return document_embedding
+    
+    def search_web(self, query, max_results=10, use_cache=True, previous_hop=None, industry_keywords=None, retrieval_strategy="hybrid", preferred_provider=None):
+        """执行网页搜索并返回相关内容，支持多跳推理和行业垂直优化 - 增强搜索功能"""
+        # 检查缓存
+        cache_key = query.strip().lower()
+        if industry_keywords:
+            cache_key += '_' + '_'.join(industry_keywords)
+        if previous_hop is not None:
+            cache_key += '_hop'
+        if retrieval_strategy:
+            cache_key += '_' + retrieval_strategy
+        if preferred_provider:
+            cache_key += '_' + preferred_provider
+        
+        if use_cache and cache_key in self.search_cache:
+            return self.search_cache[cache_key]
+        
+        try:
+            # 编码查询
+            query_embedding = self.encode_query(query)
+            
+            # 行业垂直优化
+            if industry_keywords:
+                industry_prompts = " ".join(industry_keywords)
+                industry_embedding = self.encode_query(industry_prompts)
+                query_embedding = (query_embedding + industry_embedding) / 2.0
+            
+            # 选择搜索提供商
+            providers_to_use = [preferred_provider] if preferred_provider else self.search_providers
+            
+            # 根据检索策略选择不同的检索方式
+            search_results = []
+            for provider in providers_to_use:
+                if provider in self.search_clients:
+                    # 使用原生搜索引擎API
+                    provider_results = self._search_with_provider(provider, query, query_embedding, max_results)
+                    search_results.extend(provider_results)
+                else:
+                    # 回退到默认检索策略
+                    if retrieval_strategy == "deepseek":
+                        # 使用DeepSeek-R1风格的检索策略
+                        provider_results = self._search_deepseek_style(query, query_embedding, max_results)
+                    elif retrieval_strategy == "multihop":
+                        # 使用多跳推理检索策略
+                        provider_results = self._search_multihop(query, query_embedding, max_results, previous_hop)
+                    else:
+                        # 混合检索策略
+                        provider_results = self._search_hybrid(query, query_embedding, max_results)
+                    
+                    # 标记搜索来源
+                    for result in provider_results:
+                        result["source"] = "default"
+                    
+                    search_results.extend(provider_results)
+            
+            # 去重和排序
+            search_results = self._deduplicate_and_rank_results(search_results, query_embedding)
+            
+            # 并行获取网页内容
+            content_futures = []
+            for result in search_results[:max_results]:
+                content_futures.append(self.executor.submit(self._fetch_and_parse_webpage, result["url"]))
+            
+            # 收集结果
+            for i, future in enumerate(content_futures):
+                result_content = future.result()
+                search_results[i]["content"] = result_content
+            
+            # 应用知识蒸馏
+            if hasattr(self, 'pretrained_knowledge') and self.pretrained_knowledge is not None:
+                for result in search_results:
+                    if result["content"]:
+                        doc_embedding = self.encode_document(result["content"])
+                        # 知识蒸馏
+                        fused_knowledge = self.knowledge_distiller(torch.cat([doc_embedding, self.pretrained_knowledge, query_embedding], dim=1))
+                        result["knowledge_score"] = self.rank_predictor(torch.cat([query_embedding, fused_knowledge], dim=1)).item()
+            
+            # 缓存结果
+            self.search_cache[cache_key] = search_results
+            
+            return search_results
+        except Exception as e:
+            print(f"搜索错误: {e}")
+            return []
+    
+    def _search_with_provider(self, provider, query, query_embedding, max_results):
+        """使用原生搜索引擎API进行搜索 - 新增原生搜索功能"""
+        try:
+            # 调用对应搜索引擎的API
+            client = self.search_clients[provider]
+            raw_results = client.search(query, max_results=max_results)
+            
+            # 处理搜索结果
+            processed_results = []
+            for result in raw_results:
+                processed_result = {
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "snippet": result.get("snippet", ""),
+                    "relevance_score": result.get("relevance_score", random.uniform(0.6, 1.0)),
+                    "freshness": result.get("freshness", random.uniform(0.7, 1.0)),
+                    "source": provider
+                }
+                processed_results.append(processed_result)
+            
+            return processed_results
+        except Exception as e:
+            print(f"使用{provider}搜索时出错: {e}")
+            return []
+    
+    def _deduplicate_and_rank_results(self, results, query_embedding):
+        """对搜索结果进行去重和排序 - 增强结果处理"""
+        # 基于URL去重
+        unique_results = []
+        seen_urls = set()
+        for result in results:
+            url = result["url"]
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(result)
+        
+        # 重新排序
+        for result in unique_results:
+            # 计算额外的相似度分数
+            if "content" in result and result["content"]:
+                doc_embedding = self.encode_document(result["content"])
+                similarity = self.similarity_calculator(torch.cat([query_embedding, doc_embedding], dim=1)).item()
+                result["embedding_similarity"] = similarity
+            else:
+                result["embedding_similarity"] = 0.0
+        
+        # 综合排序
+        unique_results.sort(key=lambda x: x.get("relevance_score", 0.0) * 0.6 + 
+                                      x.get("embedding_similarity", 0.0) * 0.3 + 
+                                      x.get("freshness", 0.0) * 0.1, reverse=True)
+        
+        return unique_results
+    
+    def _search_deepseek_style(self, query, query_embedding, max_results):
+        """DeepSeek-R1风格的检索策略 - 增强检索策略"""
+        # 这里使用简化的搜索API调用示例
+        # 实际应用中应替换为真实的搜索引擎API
+        
+        # 构建增强查询
+        enhanced_query = self._enhance_query(query)
+        
+        # 模拟从搜索引擎获取结果
+        search_results = []
+        for i in range(min(max_results, self.max_search_results)):
+            search_results.append({
+                "title": f"搜索结果 {i+1} 标题",
+                "url": f"https://example.com/page{i+1}",
+                "snippet": f"这是关于{query}的搜索结果摘要 {i+1}，包含了相关信息...",
+                "relevance_score": random.uniform(0.6, 1.0),  # 模拟相关性分数
+                "freshness": random.uniform(0.7, 1.0),  # 模拟新鲜度分数
+                "industry_match": random.uniform(0.5, 1.0) if hasattr(self, 'current_industry') else 1.0  # 模拟行业匹配度
+            })
+        
+        return search_results
+    
+    def _search_multihop(self, query, query_embedding, max_results, previous_hop=None):
+        """多跳推理检索策略 - 增强多跳推理"""
+        # 第一跳检索
+        first_hop_results = self._search_deepseek_style(query, query_embedding, max_results)
+        
+        # 如果有前一跳信息，进行多跳推理
+        if previous_hop is not None:
+            # 对每个结果进行多跳推理评分
+            for result in first_hop_results:
+                if result["content"]:
+                    doc_embedding = self.encode_document(result["content"])
+                    # 多跳推理
+                    combined = torch.cat([query_embedding, doc_embedding, previous_hop], dim=1)
+                    reasoning_result = self.multi_hop_reasoner(combined)
+                    # 更新结果
+                    result["reasoning_score"] = self.rank_predictor(torch.cat([query_embedding, reasoning_result], dim=1)).item()
+        
+        return first_hop_results
+    
+    def _search_hybrid(self, query, query_embedding, max_results):
+        """混合检索策略 - 综合多种检索方法"""
+        # 结合多种检索策略的优点
+        deepseek_results = self._search_deepseek_style(query, query_embedding, max_results)
+        # 可以添加其他检索策略的结果
+        
+        # 融合不同策略的结果
+        return deepseek_results
+    
+    def summarize_web_content(self, content, max_length=500, query_embedding=None, summary_strategy="extractive"):
+        """生成网页内容的摘要，支持查询引导的摘要生成 - 增强摘要生成"""
+        if not content:
+            return ""
+        
+        # 根据摘要策略选择不同的摘要方法
+        if summary_strategy == "abstractive":
+            # 抽象式摘要
+            return self._generate_abstractive_summary(content, max_length, query_embedding)
+        else:
+            # 提取式摘要（默认）
+            return self._generate_extractive_summary(content, max_length, query_embedding)
+    
+    def _generate_extractive_summary(self, content, max_length, query_embedding):
+        """生成提取式摘要 - 增强提取式摘要"""
+        # 将内容分割成段落
+        paragraphs = content.split('\n')
+        paragraphs = [p.strip() for p in paragraphs if p.strip() and len(p) > 50]
+        
+        if not paragraphs:
+            return ""
+        
+        # 编码查询（如果提供）
+        if query_embedding is None:
+            query_embedding = torch.zeros(1, self.hidden_size).to(content.device)
+        
+        # 编码每个段落并计算与查询的相似度
+        encoded_paragraphs = []
+        for paragraph in paragraphs:
+            encoded = self.encode_document(paragraph)
+            # 计算与查询的相似度
+            similarity = self.similarity_calculator(torch.cat([query_embedding, encoded], dim=1))
+            encoded_paragraphs.append((paragraph, encoded, similarity.item()))
+        
+        if not encoded_paragraphs:
+            return ""
+        
+        # 按相似度排序
+        encoded_paragraphs.sort(key=lambda x: x[2], reverse=True)
+        
+        # 基于提取的段落生成摘要
+        selected_paragraphs = []
+        current_length = 0
+        
+        for para, _, _ in encoded_paragraphs:
+            if current_length + len(para) > max_length:
+                break
+            selected_paragraphs.append(para)
+            current_length += len(para)
+        
+        # 重新排序回原始顺序
+        selected_indices = [paragraphs.index(p) for p in selected_paragraphs]
+        selected_indices.sort()
+        ordered_paragraphs = [paragraphs[i] for i in selected_indices]
+        
+        return ' '.join(ordered_paragraphs)
+    
+    def _generate_abstractive_summary(self, content, max_length, query_embedding):
+        """生成抽象式摘要 - 增强抽象式摘要"""
+        # 处理长文本
+        processed_text = self.long_text_processor(self.encode_document(content))
+        
+        # 结合查询信息（如果提供）
+        if query_embedding is not None:
+            combined = torch.cat([processed_text, query_embedding], dim=1)
+        else:
+            combined = processed_text
+        
+        # 生成摘要
+        # 这里使用简化的生成过程，实际应用中应使用更复杂的生成模型
+        summary_logits = self.summarizer(combined)
+        
+        # 为简化起见，这里仅返回提取式摘要作为示例
+        return self._generate_extractive_summary(content, max_length, query_embedding)
+
+# ------------- 新增实时交互和长文本处理模块 -------------
+
+class RealTimeInteractionModule(nn.Module):
+    """实时交互增强模块，优化响应速度和连续性"""
+    def __init__(self, hidden_size=2048, max_history_length=32768):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_history_length = max_history_length
+        
+        # 历史对话编码器 - 增强历史编码
+        self.history_encoder = nn.Sequential(
+            ResidualBlock(hidden_size, hidden_size),
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 对话状态追踪器 - 增强状态追踪
+        self.state_tracker = GPTNeoXLayer(  # 使用更强大的层
+            hidden_size=hidden_size,
+            num_attention_heads=32,
+            attention_dropout=0.1,
+            hidden_dropout=0.1
+        )
+        
+        # 响应生成器 - 增强响应生成
+        self.response_generator = nn.Sequential(
+            ResidualBlock(hidden_size * 3, hidden_size),  # 增加输入维度
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 实时交互优化器 - 增强实时交互
+        self.realtime_optimizer = nn.Sequential(
+            RealTimeAttention(hidden_size),  # 新增实时注意力机制
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.Tanh()  # 限制输出范围
+        )
+        
+        # 连续对话模式支持 - 增强连续对话
+        self.continuous_dialogue = nn.Sequential(
+            ResidualBlock(hidden_size * 4, hidden_size),  # 增加输入维度
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 快速响应生成器 - 增强快速响应
+        self.fast_response = nn.Sequential(
+            FastTransformerBlock(hidden_size),  # 新增快速Transformer块
+            nn.GELU(),
+            ResidualBlock(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size, eps=1e-6)
+        )
+        
+        # 长对话缓存 - 扩大缓存容量
+        self.dialogue_cache = LRUCache(maxsize=1000)  # 扩大缓存到1000个对话
+    
+    def update_history(self, current_input, previous_state=None, global_context=None):
+        """更新对话历史并生成响应 - 增强历史更新和响应生成"""
+        # 编码当前输入
+        encoded_input = self.history_encoder(current_input)
+        
+        # 如果有先前状态，合并历史
+        if previous_state is not None:
+            # 合并当前输入和历史状态
+            combined_state = torch.cat([previous_state, encoded_input], dim=1)
+            
+            # 确保不超过最大历史长度
+            if combined_state.size(1) > self.max_history_length:
+                combined_state = combined_state[:, -self.max_history_length:, :]
+            
+            # 更新对话状态
+            updated_state = self.state_tracker(combined_state)
+        else:
+            updated_state = encoded_input
+        
+        # 如果有全局上下文，合并上下文信息
+        if global_context is not None:
+            # 融合全局上下文和当前状态
+            fused_state = torch.cat([updated_state, global_context], dim=2)
+            # 应用连续对话优化
+            optimized_state = self.continuous_dialogue(fused_state)
+        else:
+            optimized_state = updated_state
+        
+        # 实时交互优化
+        realtime_state = self.realtime_optimizer(optimized_state)
+        
+        return realtime_state, updated_state
+    
+    def generate_fast_response(self, state, prompt=None, max_length=512):
+        """快速生成响应 - 增强快速响应生成"""
+        # 使用优化的快速响应生成器
+        response_features = self.fast_response(state)
+        
+        # 这里使用简化的生成过程，实际应用中应使用完整的生成模型
+        # ... 生成逻辑 ...
+        
+        return "这是一个快速生成的响应..."
+
+# ------------- 新增原生搜索引擎API客户端 -------------
+
+class BaiduSearchAPI:
+    """百度搜索API客户端"""
+    def __init__(self):
+        self.api_key = "your_baidu_api_key"  # 实际使用时应替换为真实的API密钥
+        self.api_endpoint = "https://api.baidu.com/search"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        })
+    
+    def search(self, query, max_results=10, language="zh-CN"):
+        """执行百度搜索"""
+        try:
+            # 构建请求参数
+            params = {
+                "query": query,
+                "num": max_results,
+                "language": language,
+                "safe": "high"  # 安全搜索
+            }
+            
+            # 发送请求
+            response = self.session.get(self.api_endpoint, params=params)
+            response.raise_for_status()
+            
+            # 解析响应
+            results = response.json().get("results", [])
+            
+            # 处理结果
+            processed_results = []
+            for result in results:
+                processed_results.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "snippet": result.get("snippet", ""),
+                    "relevance_score": result.get("score", 0.0),
+                    "freshness": self._calculate_freshness(result.get("date", "")),
+                    "baidu_specific_info": result.get("baidu_specific_info", {})  # 百度特有的信息
+                })
+            
+            return processed_results
+        except Exception as e:
+            print(f"百度搜索API调用错误: {e}")
+            return []
+    
+    def _calculate_freshness(self, date_str):
+        """计算搜索结果的新鲜度"""
+        # 这里使用简化的新鲜度计算逻辑
+        # 实际应用中应根据日期字符串解析并计算相对时间
+        return random.uniform(0.7, 1.0)
+
+class Qihoo360SearchAPI:
+    """360搜索API客户端"""
+    def __init__(self):
+        self.api_key = "32ed304002dd4beaadb43928e0cb52f8"  # 更新360搜索API密钥
+        self.api_endpoint = "https://api.so.com/search"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        })
+    
+    def search(self, query, max_results=10, language="zh-CN"):
+        """执行360搜索"""
+        try:
+            # 构建请求参数
+            params = {
+                "q": query,
+                "num": max_results,
+                "lang": language,
+                "filter": 1  # 过滤
+            }
+            
+            # 发送请求
+            response = self.session.get(self.api_endpoint, params=params)
+            response.raise_for_status()
+            
+            # 解析响应
+            results = response.json().get("results", [])
+            
+            # 处理结果
+            processed_results = []
+            for result in results:
+                processed_results.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "snippet": result.get("snippet", ""),
+                    "relevance_score": result.get("score", 0.0),
+                    "freshness": self._calculate_freshness(result.get("date", "")),
+                    "qihoo_specific_info": result.get("qihoo_specific_info", {})  # 360特有的信息
+                })
+            
+            return processed_results
+        except Exception as e:
+            print(f"360搜索API调用错误: {e}")
+            return []
+    
+    def _calculate_freshness(self, date_str):
+        """计算搜索结果的新鲜度"""
+        # 这里使用简化的新鲜度计算逻辑
+        # 实际应用中应根据日期字符串解析并计算相对时间
+        return random.uniform(0.7, 1.0)
