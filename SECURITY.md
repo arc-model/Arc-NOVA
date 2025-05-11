@@ -4,7 +4,7 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| Arc-V5 (hugging face) | 2026 stop supporting MIT|
+| Arc-V5 (hugging face) | 2025 stop supporting MIT|
 | Arc-V6   | Supporting              |
 
 ## Reporting a Vulnerability
