@@ -191,7 +191,7 @@ To cite Arc-V6 in academic work, use the following format:
 | **Model**               | **Pricing (Output Tokens)** | **License**               | **Use Case Suitability**                          |
 |-------------------------|-----------------------------|---------------------------|---------------------------------------------------|
 | **Deepseek-R1**         | $4.40/million       | MIT                       | Coding, mathematical reasoning, cost-sensitive projects |
-| **Arc-V6**              | Custom (contact)     | Apache 2.0                | Multi-modal enterprise applications               |
+| **Arc-V6**              | Custom (contact)     | MIT               | Multi-modal enterprise applications               |
 | **Claude-3.5-Sonnet**  | $15/million        | Proprietary               | Ethical AI, long-context workflows                 |
 | **Qwen-3**              | Free (open-source)  | Apache 2.0/Qwen License   | Research, hybrid reasoning tasks                  |
 | **GPT-4o**             | $60/million         | Proprietary               | High-stakes tasks, multi-modal integration        |
