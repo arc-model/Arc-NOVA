@@ -1,4 +1,6 @@
 # Arc-V6
+![image](https://github.com/user-attachments/assets/4da5619b-c68a-4c14-96b2-50f5ef3fe646)
+
 # Table of Contents  
 [Introduction](#introduction)  
 [Model Summary](#model-summary)  
