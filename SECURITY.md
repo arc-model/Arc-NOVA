@@ -6,10 +6,11 @@
 | ------- | ------------------ |
 | Arc-V6 (hugging face) | Supporting|
 | Arc-V6 (Github Community)  | Supporting              |
+| Arc-ULTRA | Release on November |
 
 ## Reporting a Vulnerability
 
-New model Arc-ultra or Arc-V8 (the name still choosing, maybe we will release both) will release in late June and early July, look forward!!
+New model Arc-ultra will release in late November, look forward!!
 
 ## Update for Arc-V6
 
