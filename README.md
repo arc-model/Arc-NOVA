@@ -1,5 +1,6 @@
-# Arc-V6
-![image](https://github.com/user-attachments/assets/015e2989-8cc3-4f0f-93a5-03b7db60878a)
+# Arc-NOVA
+![image](https://github.com/user-attachments/assets/53db1e3e-3ea9-47fd-b139-a659e3300f28)
+
 
 
 # Table of Contents  
