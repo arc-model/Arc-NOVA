@@ -1,4 +1,4 @@
-# Arc-NOVA
+# Arc-ULTRA
 ![image](https://github.com/user-attachments/assets/53db1e3e-3ea9-47fd-b139-a659e3300f28)
 
 
