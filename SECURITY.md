@@ -2,15 +2,12 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| Arc-V6 (hugging face) | Supporting|
-| Arc-V6 (Github Community)  | Supporting              |
-| Arc-ULTRA | Release on November |
-
-## Reporting a Vulnerability
-
-New model Arc-ultra will release in late November, look forward!!
+| Version                | Supported    | Support Ends   | Notes                  |
+|------------------------|--------------|---------------|------------------------|
+| Arc-V6 (Hugging Face)  | Yes          | Dec 2025      |                       |
+| Arc-V6 (GitHub Comm.)  | Yes          | Dec 2025      |                       |
+| Arc-ULTRA              | In Planning  | TBD           | Releasing Dec 2025     |
+| Arc-V5                 | No           | Ended Mar 2025| Use Arc-V6 or later    |
 
 ## Update for Arc-V6
 
